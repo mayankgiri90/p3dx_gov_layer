@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/s4r4v4n04/p3dx_gov_layer/internal/db"
@@ -149,6 +150,19 @@ func (s *Server) handleGenerateContract(w http.ResponseWriter, r *http.Request) 
 			if url, ok := policy["data_url"].(string); ok {
 				in.DataURL = url
 			}
+			// the provider's "Expires on" bounds the contract; an expired policy is refused.
+			if exp, ok := policy["expiresAt"].(string); ok && strings.TrimSpace(exp) != "" {
+				if t, err := time.Parse(time.RFC3339, strings.TrimSpace(exp)); err == nil {
+					if !t.After(time.Now()) {
+						writeJSON(w, http.StatusConflict, map[string]interface{}{"status": "FAILED", "error": "DATASET_POLICY_EXPIRED",
+							"message": fmt.Sprintf("the data provider's policy for dataset %s expired on %s", datasetName, t.UTC().Format("2006-01-02"))})
+						return
+					}
+					in.ExpiresAt = &t
+				} else {
+					log.Printf("[GENERATE] Warning: dataset %s: unreadable expiresAt %q", d.DatasetID, exp)
+				}
+			}
 			if rules, ok := policy["rules"].(map[string]interface{}); ok {
 				if path, ok := rules["key_resource_path"].(string); ok {
 					in.KeyResourcePath = strings.TrimSpace(path)
@@ -248,7 +262,7 @@ func (s *Server) handleGenerateContract(w http.ResponseWriter, r *http.Request) 
 		ConsumerName:  services.ConsumerDisplayName(claims),
 		Form:          form,
 		KBSURL:        s.cfg.KBSURL,
-		ResultURL:     s.cfg.DefaultResultURL,
+		ResultURL:     s.cfg.ResultURLFor(req.ApplicationID),
 		CallbackURL:   s.cfg.ContractCallbackURL,
 
 		Infras: infraInputs,

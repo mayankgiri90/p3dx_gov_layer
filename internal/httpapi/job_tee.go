@@ -153,7 +153,7 @@ func (s *Server) runTEEJob(w http.ResponseWriter, r *http.Request) {
 		writeTEEError(w, err)
 		return
 	}
-	if s.cfg.CoordinatorAddr == "" {
+	if s.cfg.TEEDispatch != "rmq" && s.cfg.CoordinatorAddr == "" {
 		writeJSON(w, http.StatusServiceUnavailable, j{"status": "FAILED", "error": "NOT_CONFIGURED", "message": "COORDINATOR_ADDR is not set"})
 		return
 	}
@@ -169,6 +169,12 @@ func (s *Server) runTEEJob(w http.ResponseWriter, r *http.Request) {
 	payload, err := json.Marshal(sub)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, j{"status": "FAILED", "error": "INTERNAL_ERROR", "message": err.Error()})
+		return
+	}
+
+	// queue the run for the orchestrator instead of calling CreateJob.
+	if s.cfg.TEEDispatch == "rmq" {
+		s.queueTEEJob(w, r, c, sub)
 		return
 	}
 
@@ -272,14 +278,15 @@ func (s *Server) getTEEJobResult(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "BAD_REQUEST", "message": "invalid jobId"})
 		return
 	}
-	if s.cfg.ResultReadURL == "" {
+	readURL := s.resultReadURLForJob(reqCtx(r), jobID)
+	if readURL == "" {
 		writeJSON(w, http.StatusServiceUnavailable, j{"status": "FAILED", "error": "NOT_CONFIGURED", "message": "RESULT_READ_URL is not set (needs a read SAS for the result blob)"})
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(reqCtx(r), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.ResultReadURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, readURL, nil)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, j{"status": "FAILED", "error": "INTERNAL_ERROR", "message": "invalid RESULT_READ_URL"})
 		return

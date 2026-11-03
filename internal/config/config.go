@@ -99,6 +99,11 @@ type Config struct {
 	// kata.coordinator.v1.CoordinatorService/CreateJob`.
 	GrpcurlBin      string // GRPCURL_BIN (default "grpcurl")
 	CoordinatorAddr string // COORDINATOR_ADDR (host:port; empty = Run TEE disabled)
+	// TEE_DISPATCH=rmq: Run TEE publishes the sub-contract to RabbitMQ instead of CreateJob.
+	TEEDispatch      string // TEE_DISPATCH (grpc | rmq; default grpc)
+	RMQURL           string // RMQ_URL (amqp[s]://user:pw@host:port/vhost)
+	RMQTEEExchange   string // RMQ_TEE_EXCHANGE (default "tee")
+	RMQTEERoutingKey string // RMQ_TEE_ROUTING_KEY (default "tee-request")
 
 	// --- TEE attestation (services/attestation.go) ---
 	// TEEAttestationRequired defaults to TRUE: a run is refused unless the TEE
@@ -286,8 +291,12 @@ func Load() *Config {
 		TEEPollInterval:   getEnvMS("TEE_POLL_INTERVAL_MS", 5000),
 		TEEOutputTimeout:  getEnvMS("TEE_OUTPUT_TIMEOUT_MS", 60000),
 
-		GrpcurlBin:      getEnv("GRPCURL_BIN", "grpcurl"),
-		CoordinatorAddr: os.Getenv("COORDINATOR_ADDR"),
+		GrpcurlBin:       getEnv("GRPCURL_BIN", "grpcurl"),
+		CoordinatorAddr:  os.Getenv("COORDINATOR_ADDR"),
+		TEEDispatch:      getEnv("TEE_DISPATCH", "grpc"),
+		RMQURL:           os.Getenv("RMQ_URL"),
+		RMQTEEExchange:   getEnv("RMQ_TEE_EXCHANGE", "tee"),
+		RMQTEERoutingKey: getEnv("RMQ_TEE_ROUTING_KEY", "tee-request"),
 
 		TEEAttestationRequired: getEnvBool("TEE_ATTESTATION_REQUIRED", true),
 		TEEMAAIssuers:          getEnvCSV("TEE_MAA_ISSUERS"),

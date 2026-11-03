@@ -22,6 +22,9 @@ type DatasetInput struct {
 	// "Key Resource Path" field), if the provider set one. Blank falls back to
 	// the path NewTrustee derives from the dataset name/id.
 	KeyResourcePath string
+	// ExpiresAt is the APD policy's expiresAt (PolicyForm.jsx "Expires on"), if the provider set one.
+	// The contract is valid no longer than the earliest one.
+	ExpiresAt *time.Time
 }
 
 // InfraInput carries what's known about one selected infrastructure
@@ -89,6 +92,17 @@ func defaultComputeChoice(technique string) string {
 // not call APD itself — callers fetch policy/forms first (see
 // FetchPolicyForDataset / FetchDatasetForm) and pass whatever they found in
 // via Form.
+// datasetsValidUntil is the earliest dataset policy expiry, or limit when none is earlier.
+func datasetsValidUntil(ds []DatasetInput, limit time.Time) time.Time {
+	until := limit
+	for _, d := range ds {
+		if d.ExpiresAt != nil && d.ExpiresAt.Before(until) {
+			until = d.ExpiresAt.UTC()
+		}
+	}
+	return until
+}
+
 func BuildGeneratedContract(in GenerateContractInput) contract.Contract {
 	now := time.Now().UTC()
 
@@ -189,7 +203,7 @@ func BuildGeneratedContract(in GenerateContractInput) contract.Contract {
 		Lifecycle: contract.Lifecycle{
 			CreatedAt:  now,
 			ValidFrom:  now,
-			ValidUntil: now.Add(90 * 24 * time.Hour),
+			ValidUntil: datasetsValidUntil(in.Datasets, now.Add(90*24*time.Hour)),
 		},
 		Technique:     in.Technique,
 		ComputeChoice: computeChoice,
