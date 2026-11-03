@@ -50,9 +50,7 @@ pipeline {
     REGISTRY_URI    = 'https://ghcr.io'
     REGISTRY_CRED   = 'datakaveri-ghcr'
     DEPLOY_BRANCH   = 'deploy_updates'             // the branch whose builds are published
-    DEPLOY_ENABLED     = 'false'   // 'false': the running gov_layer is built with dx-azure-deployment build-time patches (TEE via
-                                   // RabbitMQ, policy expiry, workload results) that are not in this repo yet;
-                                   // deploying this image would remove them. 'true' once they are merged here.
+    DEPLOY_ENABLED     = 'true'   // 'false' stops at Push image (no deploy)
     DEPLOY_NAMESPACE   = 'p3dx-auth-ui'
     DEPLOY_TARGETS     = 'p3dx-gov-layer/gov-layer'   // deployment/container, space separated
     DEPLOY_PULL_SECRET = 'ghcr-pull'   // docker-registry secret in DEPLOY_NAMESPACE (read:packages)
