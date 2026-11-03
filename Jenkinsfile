@@ -65,8 +65,7 @@ pipeline {
     GITLEAKS_IMAGE  = 'zricethezav/gitleaks:v8.28.0'
 
     // Gates and switches
-    COVERAGE_MIN    = '25'      // % total statement coverage, blocking; measured 26.5% on 2026-10-22 — raise as tests grow
-    COVERAGE_TARGET = '80'      // % coverage goal: below it the build is UNSTABLE (blocking once COVERAGE_MIN reaches it)
+    COVERAGE_MIN    = '80'      // % total statement coverage, blocking (26.5% on 2026-11-03: builds fail until tests reach it)
     SONAR_ENABLED   = 'false'   // 'true' once a SonarQube server is configured in Jenkins
     DOCKER_BUILDKIT = '1'
   }
@@ -168,7 +167,7 @@ pipeline {
       }
     }
 
-    // 1. Unit tests with the race detector + coverage gates: below COVERAGE_MIN fails, below COVERAGE_TARGET warns.
+    // 1. Unit tests with the race detector + coverage gate: below COVERAGE_MIN stops the build.
     stage('Unit tests') {
       steps {
         script {
@@ -187,13 +186,9 @@ pipeline {
           }
           // awk does the decimal comparison (exit 0 = below the limit)
           if (sh(script: "awk -v c=${coverage} -v l=${env.COVERAGE_MIN} 'BEGIN { exit !(c+0 < l+0) }'", returnStatus: true) == 0) {
-            error "coverage ${coverage}% is below the ${env.COVERAGE_MIN}% minimum"
+            error "coverage ${coverage}% is below the ${env.COVERAGE_MIN}% minimum — see reports/coverage.html"
           }
-          if (sh(script: "awk -v c=${coverage} -v l=${env.COVERAGE_TARGET} 'BEGIN { exit !(c+0 < l+0) }'", returnStatus: true) == 0) {
-            unstable "coverage ${coverage}% is below the ${env.COVERAGE_TARGET}% target — see reports/coverage.html"
-          } else {
-            echo "coverage ${coverage}% meets the ${env.COVERAGE_TARGET}% target"
-          }
+          echo "coverage ${coverage}% meets the ${env.COVERAGE_MIN}% minimum"
         }
       }
     }
