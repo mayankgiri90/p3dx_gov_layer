@@ -332,11 +332,13 @@ pipeline {
             def d = parts[0]
             deployments << d
             before[d] = sh(script: "${k} get deployment/${d} -o jsonpath='{.metadata.annotations.deployment\\.kubernetes\\.io/revision}'", returnStdout: true).trim()
-            def patch = groovy.json.JsonOutput.toJson([spec: [template: [spec: [
-              imagePullSecrets: [[name: env.DEPLOY_PULL_SECRET]],
-              containers: [[name: parts[1], image: image, imagePullPolicy: 'IfNotPresent']]]]]])
-            // change-cause is copied to the new ReplicaSet: kubectl rollout history shows which build deployed what.
-            sh "${k} annotate deployment/${d} kubernetes.io/change-cause='${env.JOB_NAME} #${env.BUILD_NUMBER} ${IMAGE_REPO}:${env.IMAGE_TAG}' --overwrite"
+            // change-cause goes in the same patch, so only the new ReplicaSet gets it: kubectl rollout history
+            // then shows which build deployed which revision.
+            def patch = groovy.json.JsonOutput.toJson([
+              metadata: [annotations: ['kubernetes.io/change-cause': "${env.JOB_NAME} #${env.BUILD_NUMBER} ${IMAGE_REPO}:${env.IMAGE_TAG}".toString()]],
+              spec: [template: [spec: [
+                imagePullSecrets: [[name: env.DEPLOY_PULL_SECRET]],
+                containers: [[name: parts[1], image: image, imagePullPolicy: 'IfNotPresent']]]]]])
             sh "${k} patch deployment/${d} --type strategic -p '${patch}'"
           }
           def failed = []
