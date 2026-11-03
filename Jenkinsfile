@@ -68,7 +68,8 @@ pipeline {
     COSIGN_IMAGE    = 'gcr.io/projectsigstore/cosign:v2.6.1'
 
     // Gates and switches
-    COVERAGE_MIN    = '25'      // % total statement coverage; measured 26.5% on 2026-10-22 — raise as tests grow (target 70)
+    COVERAGE_MIN    = '25'      // % total statement coverage, blocking; measured 26.5% on 2026-10-22 — raise as tests grow
+    COVERAGE_TARGET = '80'      // % coverage goal: below it the build is UNSTABLE (blocking once COVERAGE_MIN reaches it)
     SONAR_ENABLED   = 'false'   // 'true' once a SonarQube server is configured in Jenkins
     COSIGN_ENABLED  = 'false'   // 'true' once cosign-key / cosign-password credentials exist
     DOCKER_BUILDKIT = '1'
@@ -93,6 +94,21 @@ pipeline {
       steps {
         echo "GIT_BRANCH=${env.GIT_BRANCH} -> branch=${branchName()} deploy=${isDeployBranch()} commit=${env.GIT_COMMIT}"
         sh 'mkdir -p reports .home .cache'
+      }
+    }
+
+    // 7. Secrets first: a leaked credential stops the build before anything else runs with the code.
+    stage('Secrets') {
+      steps {
+        script {
+          def range = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ? "${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT}..HEAD" : 'HEAD~1..HEAD'
+          docker.image(env.GITLEAKS_IMAGE).inside('--entrypoint=') {
+            sh """
+              git config --global --add safe.directory "\$PWD" 2>/dev/null || true
+              gitleaks git --log-opts="${range}" --redact --report-format json --report-path reports/gitleaks.json --exit-code 1 .
+            """
+          }
+        }
       }
     }
 
@@ -156,19 +172,31 @@ pipeline {
       }
     }
 
-    // 1. Unit tests with the race detector + coverage gate.
+    // 1. Unit tests with the race detector + coverage gates: below COVERAGE_MIN fails, below COVERAGE_TARGET warns.
     stage('Unit tests') {
       steps {
         script {
           inGo """
             go test -race -count=1 -coverprofile=reports/coverage.out -covermode=atomic ./... 2>&1 | tee reports/go-test.txt
             go tool cover -html=reports/coverage.out -o reports/coverage.html
-            go tool cover -func=reports/coverage.out | tail -1
-            go tool cover -func=reports/coverage.out | awk -v min=${env.COVERAGE_MIN} '/^total:/ { sub("%","",\$3); if (\$3+0 < min) { printf "coverage %s%% < %s%%\\n", \$3, min; exit 1 } }'
+            go tool cover -func=reports/coverage.out | tail -1 | tee reports/coverage-total.txt
           """
           // the tee above hides go test's exit code: fail explicitly on any FAIL line
           if (sh(script: "grep -qE '^(FAIL|--- FAIL|panic:)' reports/go-test.txt", returnStatus: true) == 0) {
             error 'unit tests failed — see reports/go-test.txt'
+          }
+          def coverage = sh(script: "awk '/^total:/ { sub(\"%\",\"\",\$3); print \$3 }' reports/coverage-total.txt", returnStdout: true).trim()
+          if (!coverage) {
+            error 'no coverage total — see reports/go-test.txt'
+          }
+          // awk does the decimal comparison (exit 0 = below the limit)
+          if (sh(script: "awk -v c=${coverage} -v l=${env.COVERAGE_MIN} 'BEGIN { exit !(c+0 < l+0) }'", returnStatus: true) == 0) {
+            error "coverage ${coverage}% is below the ${env.COVERAGE_MIN}% minimum"
+          }
+          if (sh(script: "awk -v c=${coverage} -v l=${env.COVERAGE_TARGET} 'BEGIN { exit !(c+0 < l+0) }'", returnStatus: true) == 0) {
+            unstable "coverage ${coverage}% is below the ${env.COVERAGE_TARGET}% target — see reports/coverage.html"
+          } else {
+            echo "coverage ${coverage}% meets the ${env.COVERAGE_TARGET}% target"
           }
         }
       }
@@ -187,7 +215,7 @@ pipeline {
       }
     }
 
-    // 6-8 run in parallel: they only read the source tree.
+    // 6 + 8 run in parallel: they only read the source tree (7, Secrets, ran first).
     stage('Security scans') {
       parallel {
         stage('SAST') {
@@ -197,19 +225,6 @@ pipeline {
                 docker.image(env.SEMGREP_IMAGE).inside("-e HOME=${env.WORKSPACE}/.home -e SEMGREP_SEND_METRICS=off") {
                   sh 'semgrep scan --config p/owasp-top-ten --config p/golang --exclude .cache --exclude .home --exclude ctx --exclude reports --json --output reports/semgrep.json --error --severity ERROR .'
                 }
-              }
-            }
-          }
-        }
-        stage('Secrets') {
-          steps {
-            script {
-              def range = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ? "${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT}..HEAD" : 'HEAD~1..HEAD'
-              docker.image(env.GITLEAKS_IMAGE).inside('--entrypoint=') {
-                sh """
-                  git config --global --add safe.directory "\$PWD" 2>/dev/null || true
-                  gitleaks git --log-opts="${range}" --redact --report-format json --report-path reports/gitleaks.json --exit-code 1 .
-                """
               }
             }
           }
