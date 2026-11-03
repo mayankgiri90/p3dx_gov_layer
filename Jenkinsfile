@@ -10,12 +10,12 @@
 // only GIT_BRANCH (e.g. "origin/deploy_updates"), so the branch is derived from that. Branch Specifier: */deploy_updates.
 // Other branches (e.g. main, version-0.1.0) run every check but do not push or bump.
 //
-// The 12 checks (see dx-azure-deployment/docs/cicd-pipeline-guide.html):
-//   1 unit tests (-race, coverage gate)   2 gofmt / go vet / golangci-lint   3 go.mod guard (+ tidy)
-//   4 commitlint + pre-commit             5 SonarQube quality gate           6 SAST (Semgrep, gosec)
-//   7 secrets (gitleaks)                  8 SCA (Trivy fs, govulncheck, osv-scanner, Snyk)
-//   9 Dockerfile/IaC (hadolint, Trivy config)   10 image scan (Trivy, Dockle)
-//   11 SBOM + Cosign signature + SLSA provenance   12 push + bump dx-gitops
+// The checks (see dx-azure-deployment/docs/cicd-pipeline-guide.html). One tool per job:
+//   1 unit tests (-race, coverage gate, HTML coverage report)   2 compile + golangci-lint (incl. vet, gofmt)
+//   3 go.mod guard (+ tidy)   4 commitlint + pre-commit   5 SonarQube quality gate   6 SAST (Semgrep)
+//   7 secrets (gitleaks)   8 SCA (Trivy fs)   9 licenses (Trivy)   10 Dockerfile/IaC (Trivy config)
+//   11 image scan (Trivy: vulnerabilities + image config)
+//   12 push (+ X.Y.Z tag when the commit has a vX.Y.Z git tag) + bump dx-gitops
 // Gates: blocking unless marked UNSTABLE below (security findings start UNSTABLE, as in dx-authz-go;
 // tighten by removing the catchError once the backlog is cleared).
 //
@@ -25,8 +25,6 @@
 //   datakaveri-ghcr      username/password — push to ghcr.io (password = PAT with write:packages)
 //   datakaveri-gitops    username/password — GitHub user + PAT that can push branches / open PRs on dx-gitops
 //   sonarqube            SonarQube server configured in Jenkins (Manage Jenkins > System), only if SONAR_ENABLED
-//   snyk-token           secret text — only if SNYK_ENABLED
-//   cosign-key           secret file (cosign.key) + cosign-password secret text — only if COSIGN_ENABLED
 
 // "origin/main" / "refs/heads/main" / "main" -> "main"
 def branchName() {
@@ -65,17 +63,10 @@ pipeline {
     PRECOMMIT_IMAGE = 'python:3.12-bookworm'   // needs git (pre-commit); -slim has none
     SEMGREP_IMAGE   = 'semgrep/semgrep:1.140.0'
     GITLEAKS_IMAGE  = 'zricethezav/gitleaks:v8.28.0'
-    OSV_IMAGE       = 'ghcr.io/google/osv-scanner:v2.2.3'
-    HADOLINT_IMAGE  = 'hadolint/hadolint:v2.12.0-debian'   // -debian: .inside needs a shell (plain image is scratch)
-    DOCKLE_IMAGE    = 'goodwithtech/dockle:v0.4.15'
-    SYFT_IMAGE      = 'anchore/syft:v1.33.0'
-    COSIGN_IMAGE    = 'gcr.io/projectsigstore/cosign:v2.6.1'
 
     // Gates and switches
-    COVERAGE_MIN    = '25'      // % total statement coverage; measured 26.5% on 2026-10-22 — raise as tests grow (target 70)
+    COVERAGE_MIN    = '80'      // % total statement coverage, blocking (26.5% on 2026-11-03: builds fail until tests reach it)
     SONAR_ENABLED   = 'false'   // 'true' once a SonarQube server is configured in Jenkins
-    SNYK_ENABLED    = 'false'   // 'true' once the snyk-token credential exists
-    COSIGN_ENABLED  = 'false'   // 'true' once cosign-key / cosign-password credentials exist
     DOCKER_BUILDKIT = '1'
   }
 
@@ -101,6 +92,21 @@ pipeline {
       }
     }
 
+    // 7. Secrets first: a leaked credential stops the build before anything else runs with the code.
+    stage('Secrets') {
+      steps {
+        script {
+          def range = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ? "${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT}..HEAD" : 'HEAD~1..HEAD'
+          docker.image(env.GITLEAKS_IMAGE).inside('--entrypoint=') {
+            sh """
+              git config --global --add safe.directory "\$PWD" 2>/dev/null || true
+              gitleaks git --log-opts="${range}" --redact --report-format json --report-path reports/gitleaks.json --exit-code 1 .
+            """
+          }
+        }
+      }
+    }
+
     // 4. Conventional Commits on the commits new to this build, then the repo's pre-commit hooks.
     stage('Commit hygiene') {
       steps {
@@ -117,9 +123,10 @@ pipeline {
             }
           }
           if (fileExists('.pre-commit-config.yaml')) {
-            // SKIP: hooks that need docker or Go inside this python container; CI runs them as their own stages
-            // (hadolint: Dockerfile / IaC, gofmt: Static checks, go-mod-guard: Static checks).
-            docker.image(env.PRECOMMIT_IMAGE).inside("-e HOME=${env.WORKSPACE}/.home -e PRE_COMMIT_HOME=${env.WORKSPACE}/.cache/pre-commit -e SKIP=hadolint-docker,gofmt,go-mod-guard") {
+            // SKIP: hooks that need docker or Go inside this python container, or that another stage already
+            // covers with its one tool (hadolint-docker: Dockerfile / IaC, gofmt + go-mod-guard: Static checks,
+            // gitleaks + detect-private-key: Secrets).
+            docker.image(env.PRECOMMIT_IMAGE).inside("-e HOME=${env.WORKSPACE}/.home -e PRE_COMMIT_HOME=${env.WORKSPACE}/.cache/pre-commit -e SKIP=hadolint-docker,gofmt,go-mod-guard,gitleaks,detect-private-key") {
               sh '''
                 pip install --quiet --user pre-commit==4.3.0
                 git config --global --add safe.directory "$PWD"
@@ -133,14 +140,12 @@ pipeline {
       }
     }
 
-    // 2 + 3. Formatting, vet, lint, and the go.mod build-isolation guard.
+    // 2 + 3. Compile, lint (golangci-lint also runs go vet and the gofmt check), and the go.mod guard.
     stage('Static checks') {
       steps {
         script {
           inGo '''
-            unformatted=$(gofmt -l $(git ls-files '*.go'))
-            if [ -n "$unformatted" ]; then echo "gofmt needed on:"; echo "$unformatted"; exit 1; fi
-            go vet ./...
+            go build ./...
             # 3. no relative replace directive (a path on someone's laptop)
             if grep -nE '^\\s*replace\\s+.*=>\\s*\\.{1,2}/' go.mod; then echo "relative replace in go.mod"; exit 1; fi
             # go.mod/go.sum must already be tidy
@@ -162,19 +167,28 @@ pipeline {
       }
     }
 
-    // 1. Unit tests with the race detector + coverage gate.
+    // 1. Unit tests with the race detector + coverage gate: below COVERAGE_MIN stops the build.
     stage('Unit tests') {
       steps {
         script {
           inGo """
             go test -race -count=1 -coverprofile=reports/coverage.out -covermode=atomic ./... 2>&1 | tee reports/go-test.txt
-            go tool cover -func=reports/coverage.out | tail -1
-            go tool cover -func=reports/coverage.out | awk -v min=${env.COVERAGE_MIN} '/^total:/ { sub("%","",\$3); if (\$3+0 < min) { printf "coverage %s%% < %s%%\\n", \$3, min; exit 1 } }'
+            go tool cover -html=reports/coverage.out -o reports/coverage.html
+            go tool cover -func=reports/coverage.out | tail -1 | tee reports/coverage-total.txt
           """
           // the tee above hides go test's exit code: fail explicitly on any FAIL line
           if (sh(script: "grep -qE '^(FAIL|--- FAIL|panic:)' reports/go-test.txt", returnStatus: true) == 0) {
             error 'unit tests failed — see reports/go-test.txt'
           }
+          def coverage = sh(script: "awk '/^total:/ { sub(\"%\",\"\",\$3); print \$3 }' reports/coverage-total.txt", returnStdout: true).trim()
+          if (!coverage) {
+            error 'no coverage total — see reports/go-test.txt'
+          }
+          // awk does the decimal comparison (exit 0 = below the limit)
+          if (sh(script: "awk -v c=${coverage} -v l=${env.COVERAGE_MIN} 'BEGIN { exit !(c+0 < l+0) }'", returnStatus: true) == 0) {
+            error "coverage ${coverage}% is below the ${env.COVERAGE_MIN}% minimum — see reports/coverage.html"
+          }
+          echo "coverage ${coverage}% meets the ${env.COVERAGE_MIN}% minimum"
         }
       }
     }
@@ -192,81 +206,49 @@ pipeline {
       }
     }
 
-    // 6-8 run in parallel: they only read the source tree.
+    // 6 + 8 run in parallel: they only read the source tree (7, Secrets, ran first).
     stage('Security scans') {
       parallel {
         stage('SAST') {
           steps {
-            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'SAST findings — see reports/semgrep.json, reports/gosec.json') {
+            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'SAST findings — see reports/semgrep.json') {
               script {
                 docker.image(env.SEMGREP_IMAGE).inside("-e HOME=${env.WORKSPACE}/.home -e SEMGREP_SEND_METRICS=off") {
                   sh 'semgrep scan --config p/owasp-top-ten --config p/golang --exclude .cache --exclude .home --exclude ctx --exclude reports --json --output reports/semgrep.json --error --severity ERROR .'
                 }
-                inGo '''
-                  go install github.com/securego/gosec/v2/cmd/gosec@v2.22.8
-                  "$(go env GOPATH)/bin/gosec" -exclude-dir=.cache -exclude-dir=.home -exclude-dir=reports -severity high -confidence medium -fmt json -out reports/gosec.json -stdout ./...
-                '''
-              }
-            }
-          }
-        }
-        stage('Secrets') {
-          steps {
-            script {
-              def range = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ? "${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT}..HEAD" : 'HEAD~1..HEAD'
-              docker.image(env.GITLEAKS_IMAGE).inside('--entrypoint=') {
-                sh """
-                  git config --global --add safe.directory "\$PWD" 2>/dev/null || true
-                  gitleaks git --log-opts="${range}" --redact --report-format json --report-path reports/gitleaks.json --exit-code 1 .
-                """
               }
             }
           }
         }
         stage('Dependencies (SCA)') {
           steps {
-            // Report first so it is archived even when the gate fails (as in dx-authz-go)
-            sh 'trivy fs --scanners vuln,secret,misconfig --skip-dirs .cache,.home,ctx,reports --output reports/trivy-fs-report.txt .'
-            // One catchError per scanner so a finding in one does not skip the others.
+            // Vulnerabilities only: secrets are the Secrets stage, misconfigurations are Dockerfile / IaC.
+            // Report first so it is archived even when the gate fails (as in dx-authz-go).
+            sh 'trivy fs --scanners vuln --skip-dirs .cache,.home,ctx,reports --output reports/trivy-fs-report.txt .'
             catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'Trivy: HIGH/CRITICAL vulnerable dependencies - see reports/trivy-fs-report.txt') {
-              sh 'trivy fs --scanners vuln,secret --skip-dirs .cache,.home,ctx,reports --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .'
-            }
-            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'govulncheck: reachable vulnerabilities - see reports/govulncheck.txt') {
-              script {
-                inGo '''
-                  go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-                  rc=0; "$(go env GOPATH)/bin/govulncheck" ./... > reports/govulncheck.txt 2>&1 || rc=$?
-                  cat reports/govulncheck.txt; exit $rc
-                '''
-              }
-            }
-            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'osv-scanner: vulnerable dependencies - see reports/osv-scanner.txt') {
-              script {
-                docker.image(env.OSV_IMAGE).inside('--entrypoint=') {
-                  sh '/osv-scanner scan source -L go.mod --format table > reports/osv-scanner.txt || { cat reports/osv-scanner.txt; exit 1; }'
-                }
-              }
-            }
-            script {
-              if (env.SNYK_ENABLED == 'true') {
-                withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
-                  sh 'docker run --rm -e SNYK_TOKEN -v "$PWD:/project" -w /project snyk/snyk:golang snyk monitor --org=datakaveri --project-name=p3dx_gov_layer || true'
-                }
-              }
+              sh 'trivy fs --scanners vuln --skip-dirs .cache,.home,ctx,reports --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .'
             }
           }
         }
       }
     }
 
-    // 9. Dockerfile and IaC misconfiguration.
+    // 9. Third-party licenses of the Go modules (the license list Carbyne Stack attaches to its releases).
+    // Trivy reads the licenses from the module cache Unit tests filled; GOPATH points it there.
+    // CRITICAL = forbidden licenses (e.g. AGPL), HIGH = restricted (e.g. GPL): UNSTABLE until reviewed.
+    stage('Licenses') {
+      steps {
+        sh 'mkdir -p .cache/gopath/pkg && ln -sfn "$PWD/.cache/gomod" .cache/gopath/pkg/mod'
+        sh 'GOPATH="$PWD/.cache/gopath" trivy fs --scanners license --skip-dirs .cache,.home,ctx,reports --output reports/licenses.txt .'
+        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE', message: 'Restricted or forbidden licenses - see reports/licenses.txt') {
+          sh 'GOPATH="$PWD/.cache/gopath" trivy fs --scanners license --skip-dirs .cache,.home,ctx,reports --severity HIGH,CRITICAL --exit-code 1 .'
+        }
+      }
+    }
+
+    // 10. Dockerfile and IaC misconfiguration.
     stage('Dockerfile / IaC') {
       steps {
-        script {
-          docker.image(env.HADOLINT_IMAGE).inside('--entrypoint=') {
-            sh 'hadolint --failure-threshold warning Dockerfile | tee reports/hadolint.txt'
-          }
-        }
         sh 'trivy config --skip-dirs .cache,.home,ctx,reports --severity HIGH,CRITICAL --exit-code 1 --output reports/trivy-config.txt . || { cat reports/trivy-config.txt; exit 1; }'
       }
     }
@@ -292,21 +274,18 @@ pipeline {
       }
     }
 
-    // 10. Image scan: CRITICAL blocks, HIGH warns (dx-gitops docs/CICD.md: fail on CRITICAL), Dockle FATAL blocks.
+    // 11. Image scan with Trivy: OS/binary vulnerabilities plus the image config (root user, secrets in
+    // ENV/labels, ...). CRITICAL blocks, HIGH warns (dx-gitops docs/CICD.md: fail on CRITICAL).
     stage('Image scan') {
       steps {
         script {
-          sh "trivy image --output reports/trivy-image-report.txt ${devImage.imageName()}"
-          sh "trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed ${devImage.imageName()}"
+          def scan = "trivy image --image-config-scanners misconfig,secret"
+          sh "${scan} --output reports/trivy-image-report.txt ${devImage.imageName()}"
+          sh "${scan} --exit-code 1 --severity CRITICAL --ignore-unfixed ${devImage.imageName()}"
           catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE',
-                     message: 'Trivy found fixable HIGH vulnerabilities — see trivy-image-report.txt') {
-            sh "trivy image --exit-code 1 --severity HIGH --ignore-unfixed ${devImage.imageName()}"
+                     message: 'Trivy found fixable HIGH findings — see trivy-image-report.txt') {
+            sh "${scan} --exit-code 1 --severity HIGH --ignore-unfixed ${devImage.imageName()}"
           }
-          sh """
-            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ${env.DOCKLE_IMAGE} \\
-              --exit-code 1 --exit-level fatal --format json ${devImage.imageName()} > reports/dockle.json \\
-              || { cat reports/dockle.json; exit 1; }
-          """
         }
       }
     }
@@ -315,51 +294,18 @@ pipeline {
       when { expression { return isDeployBranch() } }
       steps {
         script {
+          // A release is a vX.Y.Z git tag on the built commit: also publish the image as X.Y.Z.
+          // (Polling watches the branch only, so tagging an already-built commit needs a manual "Build Now".)
+          def release = sh(script: "git tag --points-at HEAD | grep -E '^v?[0-9]+\\.[0-9]+\\.[0-9]+\$' | sort -V | tail -1 | sed 's/^v//'", returnStdout: true).trim()
           docker.withRegistry(REGISTRY_URI, REGISTRY_CRED) {
             devImage.push(env.IMAGE_TAG)
+            if (release) {
+              devImage.push(release)
+              echo "release ${release}: also pushed ${IMAGE_REPO}:${release}"
+            }
           }
-          // immutable reference used for signing / attestations
           env.IMAGE_DIGEST = sh(script: "docker inspect --format='{{index .RepoDigests 0}}' ${devImage.imageName()} | sed 's/.*@//'", returnStdout: true).trim()
           echo "pushed ${IMAGE_REPO}:${env.IMAGE_TAG}@${env.IMAGE_DIGEST}"
-        }
-      }
-    }
-
-    // 11. SBOM always; signature + SBOM/provenance attestations on published images.
-    stage('Supply chain (SBOM, sign, provenance)') {
-      steps {
-        script {
-          sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ${env.SYFT_IMAGE} ${devImage.imageName()} -o cyclonedx-json > reports/sbom.cdx.json"
-          if (isDeployBranch() && env.COSIGN_ENABLED == 'true') {
-            writeFile file: 'reports/provenance.json', text: """{
-  "buildDefinition": {
-    "buildType": "https://jenkins.io/pipeline@v1",
-    "externalParameters": {"repository": "https://github.com/datakaveri/p3dx_gov_layer", "ref": "${branchName()}"},
-    "resolvedDependencies": [{"uri": "git+https://github.com/datakaveri/p3dx_gov_layer", "digest": {"gitCommit": "${env.GIT_COMMIT}"}}]
-  },
-  "runDetails": {
-    "builder": {"id": "${env.JENKINS_URL}"},
-    "metadata": {"invocationId": "${env.BUILD_URL}", "startedOn": "${env.BUILD_TIME}"}
-  }
-}
-"""
-            withCredentials([file(credentialsId: 'cosign-key', variable: 'COSIGN_KEY_FILE'),
-                             string(credentialsId: 'cosign-password', variable: 'COSIGN_PASSWORD'),
-                             usernamePassword(credentialsId: REGISTRY_CRED, usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
-              sh '''
-                set +x
-                REF="$IMAGE_REPO@$IMAGE_DIGEST"
-                run() { docker run --rm -e COSIGN_PASSWORD -v "$COSIGN_KEY_FILE:/keys/cosign.key:ro" -v "$PWD/reports:/reports:ro" \
-                          -e REG_USER -e REG_PASS --entrypoint sh "$COSIGN_IMAGE" -c \
-                          "cosign login ghcr.io -u \\"\\$REG_USER\\" -p \\"\\$REG_PASS\\" >/dev/null && $*"; }
-                run cosign sign --yes --key /keys/cosign.key "$REF"
-                run cosign attest --yes --key /keys/cosign.key --type cyclonedx --predicate /reports/sbom.cdx.json "$REF"
-                run cosign attest --yes --key /keys/cosign.key --type slsaprovenance1 --predicate /reports/provenance.json "$REF"
-              '''
-            }
-          } else {
-            echo 'SBOM generated; signing skipped (not the deploy branch, or COSIGN_ENABLED=false)'
-          }
         }
       }
     }
