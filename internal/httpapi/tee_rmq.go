@@ -56,12 +56,12 @@ func (s *Server) publishTEERequest(ctx context.Context, msg teeRunRequest) error
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	ch, err := conn.Channel()
 	if err != nil {
 		return fmt.Errorf("channel: %w", err)
 	}
-	defer ch.Close()
+	defer func() { _ = ch.Close() }()
 	if err := ch.Confirm(false); err != nil {
 		return fmt.Errorf("confirm mode: %w", err)
 	}
