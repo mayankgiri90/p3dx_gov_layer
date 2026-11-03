@@ -20,8 +20,8 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/gov-layer ./cmd/server
 # grpcurl: Run TEE / job status call the Kata coordinator (CreateJob, GetJob) through it (GRPCURL_BIN).
-# Built here with the same Go toolchain, pinned to a release.
-RUN CGO_ENABLED=0 GOBIN=/out go install -trimpath -ldflags="-s -w" github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
+# Built here with the same Go toolchain, pinned to a release (v1.9.4: built with grpc 1.83).
+RUN CGO_ENABLED=0 GOBIN=/out go install -trimpath -ldflags="-s -w" github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.4
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
