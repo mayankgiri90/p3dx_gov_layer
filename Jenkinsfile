@@ -1,29 +1,30 @@
-// CI for p3dx_gov_layer — check, build, scan, publish, then hand the image tag to GitOps.
+// CI/CD for p3dx_gov_layer — check, build, scan, publish, deploy.
 //
-// Same model as the dx-authz-go Jenkinsfile: CI lives here, CD lives in dx-gitops (Argo CD), and the only
-// handoff is the image tag. On a build of DEPLOY_BRANCH this pipeline pushes
-// ghcr.io/datakaveri/p3dx-gov-layer:<semver>-<sha> and (when GITOPS_ENABLED) opens a PR against dx-gitops
-// that bumps image.tag in environments/dev/p3dx-gov-layer.yaml. Merging that PR is what deploys.
-// Jenkins never touches the cluster.
+// On a build of DEPLOY_BRANCH this pipeline pushes ghcr.io/datakaveri/p3dx-gov-layer:<semver>-<sha> and, when
+// DEPLOY_ENABLED, rolls that exact image (by digest) out to the dev cluster: deployment p3dx-gov-layer in
+// namespace p3dx-auth-ui. If the rollout does not become ready it is rolled back and the build fails.
 //
 // Job type: plain Pipeline ("Pipeline script from SCM"), NOT Multibranch. Such a job has no BRANCH_NAME,
 // only GIT_BRANCH (e.g. "origin/deploy_updates"), so the branch is derived from that. Branch Specifier: */deploy_updates.
-// Other branches (e.g. main, version-0.1.0) run every check but do not push or bump.
+// Other branches (e.g. main, version-0.1.0) run every check but do not push or deploy.
 //
 // The checks (see dx-azure-deployment/docs/cicd-pipeline-guide.html). One tool per job:
 //   1 unit tests (-race, coverage gate, HTML coverage report)   2 compile + golangci-lint (incl. vet, gofmt)
 //   3 go.mod guard (+ tidy)   4 commitlint + pre-commit   5 SonarQube quality gate   6 SAST (Semgrep)
 //   7 secrets (gitleaks)   8 SCA (Trivy fs)   9 licenses (Trivy)   10 Dockerfile/IaC (Trivy config)
 //   11 image scan (Trivy: vulnerabilities + image config)
-//   12 push (+ X.Y.Z tag when the commit has a vX.Y.Z git tag) + bump dx-gitops
+//   12 push (+ X.Y.Z tag when the commit has a vX.Y.Z git tag)   13 deploy to the dev cluster (kubectl)
 // Gates: blocking unless marked UNSTABLE below (security findings start UNSTABLE, as in dx-authz-go;
 // tighten by removing the catchError once the backlog is cleared).
 //
-// Agent needs only: docker, git, curl, trivy (as for dx-authz-go). Every other tool runs from a pinned image.
+// Deploy: kubectl on the agent, authenticated as the agent pod's ServiceAccount (jenkins/jenkins-agent),
+// which may only update the deployments in DEPLOY_TARGETS (dx-azure-deployment cicd/jenkins/deployer-rbac*.yaml).
+// The cluster pulls the image with the ghcr-pull secret in DEPLOY_NAMESPACE.
+//
+// Agent needs only: docker, git, curl, trivy, kubectl. Every other tool runs from a pinned image.
 //
 // Jenkins credentials expected:
 //   datakaveri-ghcr      username/password — push to ghcr.io (password = PAT with write:packages)
-//   datakaveri-gitops    username/password — GitHub user + PAT that can push branches / open PRs on dx-gitops
 //   sonarqube            SonarQube server configured in Jenkins (Manage Jenkins > System), only if SONAR_ENABLED
 
 // "origin/main" / "refs/heads/main" / "main" -> "main"
@@ -49,10 +50,13 @@ pipeline {
     REGISTRY_URI    = 'https://ghcr.io'
     REGISTRY_CRED   = 'datakaveri-ghcr'
     DEPLOY_BRANCH   = 'deploy_updates'             // the branch whose builds are published
-    GITOPS_ENABLED  = 'false'                      // 'true' once environments/dev/p3dx-gov-layer.yaml exists in dx-gitops
-    GITOPS_REPO     = 'datakaveri/dx-gitops'
-    GITOPS_BRANCH   = 'dev'
-    GITOPS_CRED     = 'datakaveri-gitops'
+    DEPLOY_ENABLED     = 'false'   // 'false': the running gov_layer is built with dx-azure-deployment build-time patches (TEE via
+                                   // RabbitMQ, policy expiry, workload results) that are not in this repo yet;
+                                   // deploying this image would remove them. 'true' once they are merged here.
+    DEPLOY_NAMESPACE   = 'p3dx-auth-ui'
+    DEPLOY_TARGETS     = 'p3dx-gov-layer/gov-layer'   // deployment/container, space separated
+    DEPLOY_PULL_SECRET = 'ghcr-pull'   // docker-registry secret in DEPLOY_NAMESPACE (read:packages)
+    DEPLOY_TIMEOUT     = '300s'   // per rollout; slower = rolled back
     GIT_HASH        = GIT_COMMIT.take(7)
 
     // Pinned tool images (bump deliberately, never :latest)
@@ -310,49 +314,50 @@ pipeline {
       }
     }
 
-    // 12. Hand the tag to GitOps (only once dx-gitops has a values file for this service).
-    stage('Bump dx-gitops dev') {
-      when { expression { return isDeployBranch() && env.GITOPS_ENABLED == 'true' } }
+    // 13. CD: roll the image just pushed (by digest, so the cluster runs exactly what was scanned) out to the
+    // deployments in DEPLOY_TARGETS. kubectl patch is the equivalent of helm upgrade here: these services are
+    // plain Deployments, not Helm releases. A rollout that is not ready within DEPLOY_TIMEOUT is undone
+    // (all targets, back to the revision they had before this build) and the build fails.
+    stage('Deploy (dev)') {
+      when { expression { return isDeployBranch() && env.DEPLOY_ENABLED == 'true' && env.IMAGE_DIGEST } }
       steps {
-        // Username with password credential: the password must be a GitHub PAT.
-        withCredentials([usernamePassword(credentialsId: GITOPS_CRED, usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
-          script {
-            def branch = "bot/${SERVICE}-${env.IMAGE_TAG}"
-            // Token goes through the environment, never into the command line Jenkins echoes.
-            sh """
-              set +x
-              set -e
-              rm -rf gitops && mkdir gitops && cd gitops
-              git init -q
-              git remote add origin "https://x-access-token:\${GH_TOKEN}@github.com/${GITOPS_REPO}.git"
-              git fetch -q --depth 1 origin ${GITOPS_BRANCH}
-              git checkout -q -b ${branch} FETCH_HEAD
-
-              f=environments/dev/${SERVICE}.yaml
-              [ -f "\$f" ] || { echo "\$f does not exist in ${GITOPS_REPO}@${GITOPS_BRANCH}"; exit 1; }
-              # Only the tag: directly under the top-level image: key.
-              sed -i -E '/^image:/,/^[^ #]/ s|^  tag:.*|  tag: "${env.IMAGE_TAG}"|' "\$f"
-              if ! grep -qE '^  tag: "${env.IMAGE_TAG}"' "\$f"; then
-                echo "Could not set image.tag in \$f"
-                exit 1
-              fi
-              git diff --stat
-
-              git -c user.name='jenkins-ci' -c user.email='jenkins-ci@datakaveri.org' \\
-                commit -q -am "chore(dev): ${SERVICE} -> ${env.IMAGE_TAG}"
-              git push -q origin ${branch}
-            """
-
-            // Open the PR through the GitHub API (no gh CLI needed on the agent).
-            sh """
-              set +x
-              curl -fsS -X POST \\
-                -H "Authorization: Bearer \${GH_TOKEN}" \\
-                -H "Accept: application/vnd.github+json" \\
-                https://api.github.com/repos/${GITOPS_REPO}/pulls \\
-                -d '{"title":"chore(dev): ${SERVICE} -> ${env.IMAGE_TAG}","head":"${branch}","base":"${GITOPS_BRANCH}","body":"Automated image bump from ${env.BUILD_URL}\\n\\nMerging deploys ${IMAGE_REPO}:${env.IMAGE_TAG} to dev via Argo CD."}'
-            """
+        script {
+          def image = "${IMAGE_REPO}@${env.IMAGE_DIGEST}"
+          def k = "kubectl -n ${DEPLOY_NAMESPACE}"
+          def targets = env.DEPLOY_TARGETS.tokenize(' ')
+          def deployments = []
+          def before = [:]
+          for (t in targets) {
+            def parts = t.tokenize('/')
+            def d = parts[0]
+            deployments << d
+            before[d] = sh(script: "${k} get deployment/${d} -o jsonpath='{.metadata.annotations.deployment\\.kubernetes\\.io/revision}'", returnStdout: true).trim()
+            def patch = groovy.json.JsonOutput.toJson([spec: [template: [spec: [
+              imagePullSecrets: [[name: env.DEPLOY_PULL_SECRET]],
+              containers: [[name: parts[1], image: image, imagePullPolicy: 'IfNotPresent']]]]]])
+            // change-cause is copied to the new ReplicaSet: kubectl rollout history shows which build deployed what.
+            sh "${k} annotate deployment/${d} kubernetes.io/change-cause='${env.JOB_NAME} #${env.BUILD_NUMBER} ${IMAGE_REPO}:${env.IMAGE_TAG}' --overwrite"
+            sh "${k} patch deployment/${d} --type strategic -p '${patch}'"
           }
+          def failed = []
+          for (d in deployments) {
+            if (sh(script: "${k} rollout status deployment/${d} --timeout=${DEPLOY_TIMEOUT}", returnStatus: true) != 0) {
+              failed << d
+            }
+          }
+          if (failed) {
+            sh "${k} get pods -o wide || true"
+            for (d in deployments) {
+              def now = sh(script: "${k} get deployment/${d} -o jsonpath='{.metadata.annotations.deployment\\.kubernetes\\.io/revision}'", returnStdout: true).trim()
+              if (now != before[d]) {
+                sh "${k} rollout undo deployment/${d} --to-revision=${before[d]}"
+                sh "${k} rollout status deployment/${d} --timeout=${DEPLOY_TIMEOUT} || true"
+              }
+            }
+            error "deploy of ${image} failed for ${failed.join(', ')}: rolled back to the previous version"
+          }
+          sh "${k} get deployment ${deployments.join(' ')} -o wide"
+          echo "deployed ${IMAGE_REPO}:${env.IMAGE_TAG} (${env.IMAGE_DIGEST}) to ${DEPLOY_NAMESPACE}: ${deployments.join(', ')}"
         }
       }
     }
