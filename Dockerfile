@@ -19,6 +19,9 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/gov-layer ./cmd/server
+# grpcurl: Run TEE / job status call the Kata coordinator (CreateJob, GetJob) through it (GRPCURL_BIN).
+# Built here with the same Go toolchain, pinned to a release.
+RUN CGO_ENABLED=0 GOBIN=/out go install -trimpath -ldflags="-s -w" github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
@@ -32,6 +35,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=build /out/gov-layer /app/gov-layer
+COPY --from=build /out/grpcurl /usr/local/bin/grpcurl
 
 # keys/  — governance signing key (generated on first start; persist it, or
 #          every new container signs contracts with a different key)
