@@ -14,8 +14,8 @@
 //   1 unit tests (-race, coverage gate, HTML coverage report)   2 compile + golangci-lint (incl. vet, gofmt)
 //   3 go.mod guard (+ tidy)   4 commitlint + pre-commit   5 SonarQube quality gate   6 SAST (Semgrep)
 //   7 secrets (gitleaks)   8 SCA (Trivy fs)   9 licenses (Trivy)   10 Dockerfile/IaC (Trivy config)
-//   11 image scan (Trivy: vulnerabilities + image config)   12 SBOM + Cosign signature + SLSA provenance
-//   13 push (+ X.Y.Z tag when the commit has a vX.Y.Z git tag) + bump dx-gitops
+//   11 image scan (Trivy: vulnerabilities + image config)
+//   12 push (+ X.Y.Z tag when the commit has a vX.Y.Z git tag) + bump dx-gitops
 // Gates: blocking unless marked UNSTABLE below (security findings start UNSTABLE, as in dx-authz-go;
 // tighten by removing the catchError once the backlog is cleared).
 //
@@ -25,7 +25,6 @@
 //   datakaveri-ghcr      username/password — push to ghcr.io (password = PAT with write:packages)
 //   datakaveri-gitops    username/password — GitHub user + PAT that can push branches / open PRs on dx-gitops
 //   sonarqube            SonarQube server configured in Jenkins (Manage Jenkins > System), only if SONAR_ENABLED
-//   cosign-key           secret file (cosign.key) + cosign-password secret text — only if COSIGN_ENABLED
 
 // "origin/main" / "refs/heads/main" / "main" -> "main"
 def branchName() {
@@ -64,14 +63,11 @@ pipeline {
     PRECOMMIT_IMAGE = 'python:3.12-bookworm'   // needs git (pre-commit); -slim has none
     SEMGREP_IMAGE   = 'semgrep/semgrep:1.140.0'
     GITLEAKS_IMAGE  = 'zricethezav/gitleaks:v8.28.0'
-    SYFT_IMAGE      = 'anchore/syft:v1.33.0'
-    COSIGN_IMAGE    = 'gcr.io/projectsigstore/cosign:v2.6.1'
 
     // Gates and switches
     COVERAGE_MIN    = '25'      // % total statement coverage, blocking; measured 26.5% on 2026-10-22 — raise as tests grow
     COVERAGE_TARGET = '80'      // % coverage goal: below it the build is UNSTABLE (blocking once COVERAGE_MIN reaches it)
     SONAR_ENABLED   = 'false'   // 'true' once a SonarQube server is configured in Jenkins
-    COSIGN_ENABLED  = 'false'   // 'true' once cosign-key / cosign-password credentials exist
     DOCKER_BUILDKIT = '1'
   }
 
@@ -313,48 +309,8 @@ pipeline {
               echo "release ${release}: also pushed ${IMAGE_REPO}:${release}"
             }
           }
-          // immutable reference used for signing / attestations
           env.IMAGE_DIGEST = sh(script: "docker inspect --format='{{index .RepoDigests 0}}' ${devImage.imageName()} | sed 's/.*@//'", returnStdout: true).trim()
           echo "pushed ${IMAGE_REPO}:${env.IMAGE_TAG}@${env.IMAGE_DIGEST}"
-        }
-      }
-    }
-
-    // 11. SBOM always; signature + SBOM/provenance attestations on published images.
-    stage('Supply chain (SBOM, sign, provenance)') {
-      steps {
-        script {
-          sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ${env.SYFT_IMAGE} ${devImage.imageName()} -o cyclonedx-json > reports/sbom.cdx.json"
-          if (isDeployBranch() && env.COSIGN_ENABLED == 'true') {
-            writeFile file: 'reports/provenance.json', text: """{
-  "buildDefinition": {
-    "buildType": "https://jenkins.io/pipeline@v1",
-    "externalParameters": {"repository": "https://github.com/datakaveri/p3dx_gov_layer", "ref": "${branchName()}"},
-    "resolvedDependencies": [{"uri": "git+https://github.com/datakaveri/p3dx_gov_layer", "digest": {"gitCommit": "${env.GIT_COMMIT}"}}]
-  },
-  "runDetails": {
-    "builder": {"id": "${env.JENKINS_URL}"},
-    "metadata": {"invocationId": "${env.BUILD_URL}", "startedOn": "${env.BUILD_TIME}"}
-  }
-}
-"""
-            withCredentials([file(credentialsId: 'cosign-key', variable: 'COSIGN_KEY_FILE'),
-                             string(credentialsId: 'cosign-password', variable: 'COSIGN_PASSWORD'),
-                             usernamePassword(credentialsId: REGISTRY_CRED, usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
-              sh '''
-                set +x
-                REF="$IMAGE_REPO@$IMAGE_DIGEST"
-                run() { docker run --rm -e COSIGN_PASSWORD -v "$COSIGN_KEY_FILE:/keys/cosign.key:ro" -v "$PWD/reports:/reports:ro" \
-                          -e REG_USER -e REG_PASS --entrypoint sh "$COSIGN_IMAGE" -c \
-                          "cosign login ghcr.io -u \\"\\$REG_USER\\" -p \\"\\$REG_PASS\\" >/dev/null && $*"; }
-                run cosign sign --yes --key /keys/cosign.key "$REF"
-                run cosign attest --yes --key /keys/cosign.key --type cyclonedx --predicate /reports/sbom.cdx.json "$REF"
-                run cosign attest --yes --key /keys/cosign.key --type slsaprovenance1 --predicate /reports/provenance.json "$REF"
-              '''
-            }
-          } else {
-            echo 'SBOM generated; signing skipped (not the deploy branch, or COSIGN_ENABLED=false)'
-          }
         }
       }
     }
